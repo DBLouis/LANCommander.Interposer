@@ -94,6 +94,21 @@ private:
     bool& m_flag;
 };
 
+// Runs one FastDL probe with the reentrancy guard held for its duration. Both
+// the guard and the call are exception-safe: a probe that throws degrades to a
+// default value instead of unwinding through the game, and the thread_local
+// guard can never be stranded. A stranded guard silently bypasses every later
+// CreateFile on that thread — no redirect, no log — which hides the DLL from
+// the thread entirely.
+template <typename Fn>
+static auto RunFastDLProbe(Fn&& probe) -> decltype(probe())
+{
+    ScopedFlag guard(g_inFastDLHook);
+
+    try { return probe(); }
+    catch (...) { return decltype(probe())(); }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -206,12 +221,10 @@ static std::wstring ResolveOpenPath(const std::wstring& path, DWORD dwDesiredAcc
     // FastDL: for read-only opens, ensure the file is downloaded (or cached) if eligible.
     if (!(dwDesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)))
     {
-        g_inFastDLHook = true;
-        TryFastDLDownload(redirected);
+        RunFastDLProbe([&] { TryFastDLDownload(redirected); });
 
         // Serve from the overlay directory if a cached copy exists there
-        std::wstring overlayPath = GetExistingOverlayPath(redirected);
-        g_inFastDLHook = false;
+        std::wstring overlayPath = RunFastDLProbe([&] { return GetExistingOverlayPath(redirected); });
 
         if (!overlayPath.empty())
         {
@@ -235,8 +248,16 @@ static HANDLE CreateFileWImpl(
     // Suppress all hook logic during internal FastDL operations to avoid
     // reentrancy, redundant logging, and spurious redirect checks.
     if (g_inFastDLHook || g_inCreateFileHook)
+    {
+        // Trace only: legitimate re-entrant calls appear here too, but bypasses
+        // outside a FastDL/file-op window mean this thread's guard got stranded —
+        // the failure mode that makes the DLL invisible on a thread.
+        if (g_logLevel >= LogLevel::Trace)
+            LogFileDiag(L"HOOK BYPASS", path.c_str(), L"reentrancy guard active");
+
         return g_origCreateFileW(path.c_str(), dwDesiredAccess, dwShareMode,
             lpSA, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    }
 
     ScopedFlag guard(g_inCreateFileHook);
 
@@ -291,8 +312,13 @@ static HANDLE WINAPI HookCreateFile2(
     DWORD dwCreationDisposition, LPCREATEFILE2_EXTENDED_PARAMETERS pCreateExParams)
 {
     if (!lpFileName || g_inFastDLHook || g_inCreateFileHook)
+    {
+        if (lpFileName && g_logLevel >= LogLevel::Trace)
+            LogFileDiag(L"HOOK BYPASS", lpFileName, L"reentrancy guard active");
+
         return g_origCreateFile2(lpFileName, dwDesiredAccess, dwShareMode,
             dwCreationDisposition, pCreateExParams);
+    }
 
     ScopedFlag guard(g_inCreateFileHook);
 
@@ -330,9 +356,7 @@ static DWORD WINAPI HookGetFileAttributesW(LPCWSTR lpFileName)
     if (attrs == INVALID_FILE_ATTRIBUTES)
     {
         // Check overlay cache first (cheaper than a network request)
-        g_inFastDLHook = true;
-        std::wstring overlayPath = GetExistingOverlayPath(path);
-        g_inFastDLHook = false;
+        std::wstring overlayPath = RunFastDLProbe([&] { return GetExistingOverlayPath(path); });
 
         if (!overlayPath.empty())
             return g_origGetFileAttributesW(overlayPath.c_str());
@@ -340,11 +364,7 @@ static DWORD WINAPI HookGetFileAttributesW(LPCWSTR lpFileName)
         // File not in overlay — ask the FastDL server if it can supply it.
         // Report FILE_ATTRIBUTE_NORMAL so the game proceeds to open it;
         // the actual download happens in CreateFileW.
-        g_inFastDLHook = true;
-        bool exists = FastDLFileExists(path);
-        g_inFastDLHook = false;
-
-        if (exists)
+        if (RunFastDLProbe([&] { return FastDLFileExists(path); }))
             return FILE_ATTRIBUTE_NORMAL;
     }
 
@@ -382,19 +402,13 @@ static DWORD WINAPI HookGetFileAttributesA(LPCSTR lpFileName)
     if (attrs == INVALID_FILE_ATTRIBUTES)
     {
         // Check overlay cache first
-        g_inFastDLHook = true;
-        std::wstring overlayPath = GetExistingOverlayPath(wpath);
-        g_inFastDLHook = false;
+        std::wstring overlayPath = RunFastDLProbe([&] { return GetExistingOverlayPath(wpath); });
 
         if (!overlayPath.empty())
             return g_origGetFileAttributesW(overlayPath.c_str());
 
         // FastDL server existence check
-        g_inFastDLHook = true;
-        bool exists = FastDLFileExists(wpath);
-        g_inFastDLHook = false;
-
-        if (exists)
+        if (RunFastDLProbe([&] { return FastDLFileExists(wpath); }))
             return FILE_ATTRIBUTE_NORMAL;
     }
 
@@ -430,9 +444,7 @@ static BOOL WINAPI HookGetFileAttributesExW(
 
     if (!ok)
     {
-        g_inFastDLHook = true;
-        std::wstring overlayPath = GetExistingOverlayPath(path);
-        g_inFastDLHook = false;
+        std::wstring overlayPath = RunFastDLProbe([&] { return GetExistingOverlayPath(path); });
 
         if (!overlayPath.empty())
             return g_origGetFileAttributesExW(overlayPath.c_str(), fInfoLevelId, lpFileInformation);
@@ -619,7 +631,7 @@ static BOOL WINAPI HookMoveFileW(LPCWSTR lpExisting, LPCWSTR lpNew)
     if (g_inFileOpHook)
         return g_origMoveFileW(lpExisting, lpNew);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src(lpExisting ? lpExisting : L"");
     std::wstring dst(lpNew ? lpNew : L"");
@@ -637,9 +649,7 @@ static BOOL WINAPI HookMoveFileW(LPCWSTR lpExisting, LPCWSTR lpNew)
     if (rSrc == src && rDst == dst)
         LogFileAccess(L"FILE MOVE", src.c_str(), dst.c_str());
 
-    BOOL result = g_origMoveFileW(rSrc.c_str(), rDst.c_str());
-    g_inFileOpHook = false;
-    return result;
+    return g_origMoveFileW(rSrc.c_str(), rDst.c_str());
 }
 
 static BOOL WINAPI HookMoveFileA(LPCSTR lpExisting, LPCSTR lpNew)
@@ -647,16 +657,13 @@ static BOOL WINAPI HookMoveFileA(LPCSTR lpExisting, LPCSTR lpNew)
     if (g_inFileOpHook)
         return g_origMoveFileA(lpExisting, lpNew);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src = AnsiToWide(lpExisting);
     std::wstring dst = AnsiToWide(lpNew);
 
     if (src.empty() && dst.empty())
-    {
-        g_inFileOpHook = false;
         return g_origMoveFileA(lpExisting, lpNew);
-    }
 
     std::wstring rSrc = RedirectWithDiag(src);
     std::wstring rDst = RedirectWithDiag(dst);
@@ -672,13 +679,10 @@ static BOOL WINAPI HookMoveFileA(LPCSTR lpExisting, LPCSTR lpNew)
     if (rSrc == src && rDst == dst)
     {
         LogFileAccess(L"FILE MOVE", src.c_str(), dst.c_str());
-        g_inFileOpHook = false;
         return g_origMoveFileA(lpExisting, lpNew);
     }
 
-    BOOL result = g_origMoveFileW(rSrc.c_str(), rDst.c_str());
-    g_inFileOpHook = false;
-    return result;
+    return g_origMoveFileW(rSrc.c_str(), rDst.c_str());
 }
 
 static BOOL WINAPI HookMoveFileExW(LPCWSTR lpExisting, LPCWSTR lpNew, DWORD dwFlags)
@@ -686,7 +690,7 @@ static BOOL WINAPI HookMoveFileExW(LPCWSTR lpExisting, LPCWSTR lpNew, DWORD dwFl
     if (g_inFileOpHook)
         return g_origMoveFileExW(lpExisting, lpNew, dwFlags);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src(lpExisting ? lpExisting : L"");
     std::wstring dst(lpNew ? lpNew : L"");
@@ -704,9 +708,7 @@ static BOOL WINAPI HookMoveFileExW(LPCWSTR lpExisting, LPCWSTR lpNew, DWORD dwFl
     if (rSrc == src && rDst == dst)
         LogFileAccess(L"FILE MOVE", src.c_str(), dst.c_str());
 
-    BOOL result = g_origMoveFileExW(rSrc.c_str(), rDst.c_str(), dwFlags);
-    g_inFileOpHook = false;
-    return result;
+    return g_origMoveFileExW(rSrc.c_str(), rDst.c_str(), dwFlags);
 }
 
 static BOOL WINAPI HookMoveFileExA(LPCSTR lpExisting, LPCSTR lpNew, DWORD dwFlags)
@@ -714,16 +716,13 @@ static BOOL WINAPI HookMoveFileExA(LPCSTR lpExisting, LPCSTR lpNew, DWORD dwFlag
     if (g_inFileOpHook)
         return g_origMoveFileExA(lpExisting, lpNew, dwFlags);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src = AnsiToWide(lpExisting);
     std::wstring dst = AnsiToWide(lpNew);
 
     if (src.empty() && dst.empty())
-    {
-        g_inFileOpHook = false;
         return g_origMoveFileExA(lpExisting, lpNew, dwFlags);
-    }
 
     std::wstring rSrc = RedirectWithDiag(src);
     std::wstring rDst = RedirectWithDiag(dst);
@@ -739,13 +738,10 @@ static BOOL WINAPI HookMoveFileExA(LPCSTR lpExisting, LPCSTR lpNew, DWORD dwFlag
     if (rSrc == src && rDst == dst)
     {
         LogFileAccess(L"FILE MOVE", src.c_str(), dst.c_str());
-        g_inFileOpHook = false;
         return g_origMoveFileExA(lpExisting, lpNew, dwFlags);
     }
 
-    BOOL result = g_origMoveFileExW(rSrc.c_str(), rDst.c_str(), dwFlags);
-    g_inFileOpHook = false;
-    return result;
+    return g_origMoveFileExW(rSrc.c_str(), rDst.c_str(), dwFlags);
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +752,7 @@ static BOOL WINAPI HookCopyFileW(LPCWSTR lpExisting, LPCWSTR lpNew, BOOL bFailIf
     if (g_inFileOpHook)
         return g_origCopyFileW(lpExisting, lpNew, bFailIfExists);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src(lpExisting ? lpExisting : L"");
     std::wstring dst(lpNew ? lpNew : L"");
@@ -774,9 +770,7 @@ static BOOL WINAPI HookCopyFileW(LPCWSTR lpExisting, LPCWSTR lpNew, BOOL bFailIf
     if (rSrc == src && rDst == dst)
         LogFileAccess(L"FILE COPY", src.c_str(), dst.c_str());
 
-    BOOL result = g_origCopyFileW(rSrc.c_str(), rDst.c_str(), bFailIfExists);
-    g_inFileOpHook = false;
-    return result;
+    return g_origCopyFileW(rSrc.c_str(), rDst.c_str(), bFailIfExists);
 }
 
 static BOOL WINAPI HookCopyFileA(LPCSTR lpExisting, LPCSTR lpNew, BOOL bFailIfExists)
@@ -784,16 +778,13 @@ static BOOL WINAPI HookCopyFileA(LPCSTR lpExisting, LPCSTR lpNew, BOOL bFailIfEx
     if (g_inFileOpHook)
         return g_origCopyFileA(lpExisting, lpNew, bFailIfExists);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src = AnsiToWide(lpExisting);
     std::wstring dst = AnsiToWide(lpNew);
 
     if (src.empty() && dst.empty())
-    {
-        g_inFileOpHook = false;
         return g_origCopyFileA(lpExisting, lpNew, bFailIfExists);
-    }
 
     std::wstring rSrc = RedirectWithDiag(src);
     std::wstring rDst = RedirectWithDiag(dst);
@@ -809,13 +800,10 @@ static BOOL WINAPI HookCopyFileA(LPCSTR lpExisting, LPCSTR lpNew, BOOL bFailIfEx
     if (rSrc == src && rDst == dst)
     {
         LogFileAccess(L"FILE COPY", src.c_str(), dst.c_str());
-        g_inFileOpHook = false;
         return g_origCopyFileA(lpExisting, lpNew, bFailIfExists);
     }
 
-    BOOL result = g_origCopyFileW(rSrc.c_str(), rDst.c_str(), bFailIfExists);
-    g_inFileOpHook = false;
-    return result;
+    return g_origCopyFileW(rSrc.c_str(), rDst.c_str(), bFailIfExists);
 }
 
 static BOOL WINAPI HookCopyFileExW(
@@ -825,7 +813,7 @@ static BOOL WINAPI HookCopyFileExW(
     if (g_inFileOpHook)
         return g_origCopyFileExW(lpExisting, lpNew, lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src(lpExisting ? lpExisting : L"");
     std::wstring dst(lpNew ? lpNew : L"");
@@ -843,9 +831,7 @@ static BOOL WINAPI HookCopyFileExW(
     if (rSrc == src && rDst == dst)
         LogFileAccess(L"FILE COPY", src.c_str(), dst.c_str());
 
-    BOOL result = g_origCopyFileExW(rSrc.c_str(), rDst.c_str(), lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
-    g_inFileOpHook = false;
-    return result;
+    return g_origCopyFileExW(rSrc.c_str(), rDst.c_str(), lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
 }
 
 static BOOL WINAPI HookCopyFileExA(
@@ -855,16 +841,13 @@ static BOOL WINAPI HookCopyFileExA(
     if (g_inFileOpHook)
         return g_origCopyFileExA(lpExisting, lpNew, lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
 
-    g_inFileOpHook = true;
+    ScopedFlag fileOpGuard(g_inFileOpHook);
 
     std::wstring src = AnsiToWide(lpExisting);
     std::wstring dst = AnsiToWide(lpNew);
 
     if (src.empty() && dst.empty())
-    {
-        g_inFileOpHook = false;
         return g_origCopyFileExA(lpExisting, lpNew, lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
-    }
 
     std::wstring rSrc = RedirectWithDiag(src);
     std::wstring rDst = RedirectWithDiag(dst);
@@ -880,13 +863,10 @@ static BOOL WINAPI HookCopyFileExA(
     if (rSrc == src && rDst == dst)
     {
         LogFileAccess(L"FILE COPY", src.c_str(), dst.c_str());
-        g_inFileOpHook = false;
         return g_origCopyFileExA(lpExisting, lpNew, lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
     }
 
-    BOOL result = g_origCopyFileExW(rSrc.c_str(), rDst.c_str(), lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
-    g_inFileOpHook = false;
-    return result;
+    return g_origCopyFileExW(rSrc.c_str(), rDst.c_str(), lpProgressRoutine, lpData, pbCancel, dwCopyFlags);
 }
 
 // ---------------------------------------------------------------------------
