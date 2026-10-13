@@ -223,6 +223,7 @@ File redirection applies to the following Windows API functions:
 |---|---|
 | `CreateFileW` / `CreateFileA` | Applies redirect before opening; ANSI variant converts to wide first. |
 | `CreateFile2` | The modern open, used by `std::filesystem`. Extended parameters pass through untouched. |
+| `NtCreateFile` / `NtOpenFile` | The ntdll choke point every open funnels through, including routes that bypass the Win32 layer: ANSI opens that enter KernelBase's internal implementation past the hooked exports (observed on Windows 10's SysWOW64 kernelbase), and callers that resolve their own imports before the hooks exist. `\??\`-prefixed paths are converted to their Win32 form, matched, and rewritten — in place when the redirected path fits the caller's buffer, otherwise in a fresh buffer. Device paths and directory-relative opens pass through. |
 | `GetFileAttributesW` / `GetFileAttributesA` | Applies redirect before querying attributes. |
 | `GetFileAttributesExW` / `GetFileAttributesExA` | The form the CRT's `stat`/`access` and `std::filesystem::exists` / `file_size` call. |
 | `FindFirstFileW` / `FindFirstFileA` | Applies redirect before beginning enumeration. |

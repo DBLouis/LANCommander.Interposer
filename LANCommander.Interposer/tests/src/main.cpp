@@ -552,6 +552,70 @@ static void RunFileTests(const std::wstring& exeDir, const std::wstring& testTmp
             L"F-15: std::filesystem::file_size reports the redirect target's size");
     }
 
+    // F-17: the regression test for the Windows 10 bypass route. Some KernelBase
+    // builds enter the shared CreateFileW implementation internally, past the
+    // hooked exports, so the Win32-level hooks never see the open. The ntdll
+    // choke point must catch it: call NtCreateFile directly, the way KernelBase's
+    // internals do.
+    {
+        struct NtTestUnicodeString
+        {
+            USHORT Length;
+            USHORT MaximumLength;
+            PWSTR  Buffer;
+        };
+
+        struct NtTestObjectAttributes
+        {
+            ULONG Length;
+            HANDLE RootDirectory;
+            NtTestUnicodeString* ObjectName;
+            ULONG Attributes;
+            PVOID SecurityDescriptor;
+            PVOID SecurityQualityOfService;
+        };
+
+        using FnNtTestCreateFile = LONG(NTAPI*)(
+            HANDLE*, ULONG, NtTestObjectAttributes*, void*, LARGE_INTEGER*,
+            ULONG, ULONG, ULONG, ULONG, void*, ULONG);
+
+        auto ntCreateFile = reinterpret_cast<FnNtTestCreateFile>(
+            GetProcAddress(GetModuleHandleW(L"ntdll"), "NtCreateFile"));
+
+        ASSERT(ntCreateFile != nullptr, L"F-17: NtCreateFile resolved from ntdll");
+
+        std::wstring ntPath = L"\\??\\C:\\TestGame\\Saves\\profile.dat";
+        NtTestUnicodeString name{};
+        name.Length = static_cast<USHORT>(ntPath.size() * sizeof(wchar_t));
+        name.MaximumLength = static_cast<USHORT>(name.Length + sizeof(wchar_t));
+        name.Buffer = ntPath.data();
+
+        NtTestObjectAttributes attributes{};
+        attributes.Length = sizeof(attributes);
+        attributes.ObjectName = &name;
+        attributes.Attributes = OBJ_CASE_INSENSITIVE;
+
+        void* ioStatusBlock[2] = {};
+        HANDLE h = nullptr;
+
+        LONG status = ntCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &attributes,
+            ioStatusBlock, nullptr, 0, FILE_SHARE_READ, FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+
+        ASSERT(status == 0 && h != nullptr && h != INVALID_HANDLE_VALUE,
+            L"F-17: a direct NtCreateFile open is intercepted and redirected");
+
+        if (h && h != INVALID_HANDLE_VALUE)
+        {
+            char buf[64] = {};
+            DWORD read = 0;
+            ReadFile(h, buf, sizeof(buf) - 1, &read, nullptr);
+            ASSERT(read == 23 && std::string(buf) == "redirect_target_content",
+                L"F-17: the direct NT open reads the redirect target's contents");
+            CloseHandle(h);
+        }
+    }
+
     // F-16: double-fire probes. Both paths are outside every configured rule, so
     // each logs one plain verb rather than a [FILE REDIRECT] line -- the log tests
     // then assert that "one" is literal. KernelBase's GetFileAttributesA and

@@ -31,6 +31,7 @@ void InstallHooks()
     LoadConfig();
     InstallRegistryHooks();
     InstallFileHooks();
+    InstallNtFileHooks();
     InitFastDL();
     InstallNetworkHooks();
     InstallIdentityHooks();

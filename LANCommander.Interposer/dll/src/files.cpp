@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <MinHook.h>
+#include <cwchar>
 #include <string>
 
 // Reentrancy guard: FastDL downloads call CreateFileW internally (to write
@@ -41,6 +42,9 @@ using FnLoadLibraryW       = HMODULE(WINAPI*)(LPCWSTR);
 using FnLoadLibraryA       = HMODULE(WINAPI*)(LPCSTR);
 using FnLoadLibraryExW     = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
 using FnLoadLibraryExA     = HMODULE(WINAPI*)(LPCSTR,  HANDLE, DWORD);
+using FnNtCreateFile       = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, PVOID,
+                                          PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+using FnNtOpenFile         = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, PVOID, ULONG, ULONG);
 
 static FnCreateFileW        g_origCreateFileW        = nullptr;
 static FnCreateFileA        g_origCreateFileA        = nullptr;
@@ -67,6 +71,8 @@ static FnLoadLibraryW       g_origLoadLibraryW       = nullptr;
 static FnLoadLibraryA       g_origLoadLibraryA       = nullptr;
 static FnLoadLibraryExW     g_origLoadLibraryExW     = nullptr;
 static FnLoadLibraryExA     g_origLoadLibraryExA     = nullptr;
+static FnNtCreateFile       g_origNtCreateFile       = nullptr;
+static FnNtOpenFile         g_origNtOpenFile         = nullptr;
 
 // Reentrancy guard for file-management hooks. Two chains reach an already-hooked
 // export: KernelBase's own CopyFileW calls the exported CopyFileExW, and the
@@ -976,6 +982,141 @@ static HMODULE WINAPI HookLoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWO
 }
 
 // ---------------------------------------------------------------------------
+// Hook implementations — ntdll NtCreateFile / NtOpenFile
+//
+// The deepest user-mode choke point: every open in the process funnels through
+// these, including routes that never touch the exported kernel32/kernelbase
+// entries hooked above — ANSI opens that enter KernelBase's internal
+// implementation directly (observed on Windows 10's SysWOW64 kernelbase, where
+// CreateFileA reaches the shared CreateFileW body past the hooked export), and
+// callers that resolve their own imports before the hooks exist.
+//
+// Only \??\-prefixed paths with no RootDirectory are touched — the form the
+// Win32 layer produces. Device paths and directory-relative opens pass through.
+// Non-matching paths return silently: the Win32-level hooks already log them,
+// and every open in the process passes here, so echoing them would double every
+// line in the log.
+// ---------------------------------------------------------------------------
+
+// Mirrors the stable NT ABI layouts. winternl.h is deliberately not included —
+// it clashes with windows.h and we only need these three field sets.
+struct NtUnicodeString
+{
+    USHORT Length;          // bytes, excluding the terminator
+    USHORT MaximumLength;   // bytes, including room for the terminator
+    PWSTR  Buffer;
+};
+
+struct NtObjectAttributes
+{
+    ULONG Length;
+    HANDLE RootDirectory;
+    NtUnicodeString* ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+};
+
+// Rewrites a matched \??\ NT path through the redirect pipeline. In place when
+// the result fits the existing buffer; otherwise a fresh process-heap buffer is
+// swapped in and the original is left alone — never freed here. The Win32 layer
+// frees whatever Buffer points at once the call unwinds, and a caller that built
+// its own OBJECT_ATTRIBUTES still holds its original pointer, so freeing here
+// would either double-free or crash on a stack buffer. The cost is one leaked
+// path buffer per grow-rewrite.
+static bool RedirectNtPathObject(NtObjectAttributes* objectAttributes, ACCESS_MASK desiredAccess)
+{
+    if (!objectAttributes || !objectAttributes->ObjectName || objectAttributes->RootDirectory)
+        return false;
+
+    NtUnicodeString* name = objectAttributes->ObjectName;
+
+    constexpr USHORT prefixBytes = 4 * sizeof(wchar_t);   // "\??\"
+
+    if (!name->Buffer || name->Length <= prefixBytes)
+        return false;
+
+    if (wcsncmp(name->Buffer, L"\\??\\", 4) != 0)
+        return false;
+
+    std::wstring dosPath(name->Buffer + 4, (name->Length - prefixBytes) / sizeof(wchar_t));
+    std::wstring redirected = RedirectWithDiag(dosPath);
+
+    if (redirected == dosPath)
+        return false;
+
+    LogFileAccess(L"FILE REDIRECT", dosPath.c_str(), redirected.c_str());
+
+    const bool forWrite = (desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+    if (forWrite)
+        EnsureParentDirectoryExists(redirected);
+
+    // FastDL parity with the Win32-level open path: downloads and overlay
+    // serving for read-only opens.
+    else
+    {
+        RunFastDLProbe([&] { TryFastDLDownload(redirected); });
+
+        std::wstring overlayPath = RunFastDLProbe([&] { return GetExistingOverlayPath(redirected); });
+
+        if (!overlayPath.empty())
+        {
+            LogFileAccess(L"FILE OVERLAY", redirected.c_str(), overlayPath.c_str());
+            redirected = std::move(overlayPath);
+        }
+    }
+
+    std::wstring ntPath = L"\\??\\" + redirected;
+    const size_t newBytes = ntPath.size() * sizeof(wchar_t);
+
+    if (newBytes > 0xFFFF - sizeof(wchar_t))   // UNICODE_STRING lengths are 16-bit
+        return false;
+
+    if (newBytes + sizeof(wchar_t) <= name->MaximumLength)
+    {
+        memcpy(name->Buffer, ntPath.c_str(), newBytes + sizeof(wchar_t));
+        name->Length = static_cast<USHORT>(newBytes);
+        return true;
+    }
+
+    PWSTR fresh = static_cast<PWSTR>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, newBytes + sizeof(wchar_t)));
+
+    if (!fresh)
+        return false;
+
+    memcpy(fresh, ntPath.c_str(), newBytes + sizeof(wchar_t));
+    name->Buffer = fresh;
+    name->Length = static_cast<USHORT>(newBytes);
+    name->MaximumLength = static_cast<USHORT>(newBytes + sizeof(wchar_t));
+    return true;
+}
+
+static LONG NTAPI HookNtCreateFile(
+    PHANDLE fileHandle, ACCESS_MASK desiredAccess, PVOID objectAttributes,
+    PVOID ioStatusBlock, PLARGE_INTEGER allocationSize, ULONG fileAttributes,
+    ULONG shareAccess, ULONG createDisposition, ULONG createOptions,
+    PVOID eaBuffer, ULONG eaLength)
+{
+    RedirectNtPathObject(static_cast<NtObjectAttributes*>(objectAttributes), desiredAccess);
+
+    return g_origNtCreateFile(fileHandle, desiredAccess, objectAttributes,
+        ioStatusBlock, allocationSize, fileAttributes, shareAccess,
+        createDisposition, createOptions, eaBuffer, eaLength);
+}
+
+static LONG NTAPI HookNtOpenFile(
+    PHANDLE fileHandle, ACCESS_MASK desiredAccess, PVOID objectAttributes,
+    PVOID ioStatusBlock, ULONG shareAccess, ULONG openOptions)
+{
+    RedirectNtPathObject(static_cast<NtObjectAttributes*>(objectAttributes), desiredAccess);
+
+    return g_origNtOpenFile(fileHandle, desiredAccess, objectAttributes,
+        ioStatusBlock, shareAccess, openOptions);
+}
+
+// ---------------------------------------------------------------------------
 // Hook installation
 // ---------------------------------------------------------------------------
 
@@ -1046,4 +1187,20 @@ void InstallFileHooks()
         MH_CreateHookApi(L"kernel32", "LoadLibraryExA",
             reinterpret_cast<LPVOID>(HookLoadLibraryExA),
             reinterpret_cast<LPVOID*>(&g_origLoadLibraryExA)));
+}
+
+// The ntdll choke-point hooks get their own install step so the Win32-level
+// coverage above stays independent: if an NT hook fails to create, the
+// kernel32/kernelbase hooks are untouched and vice versa.
+void InstallNtFileHooks()
+{
+    LogHookInit(L"ntdll", "NtCreateFile",
+        MH_CreateHookApi(L"ntdll", "NtCreateFile",
+            reinterpret_cast<LPVOID>(HookNtCreateFile),
+            reinterpret_cast<LPVOID*>(&g_origNtCreateFile)));
+
+    LogHookInit(L"ntdll", "NtOpenFile",
+        MH_CreateHookApi(L"ntdll", "NtOpenFile",
+            reinterpret_cast<LPVOID>(HookNtOpenFile),
+            reinterpret_cast<LPVOID*>(&g_origNtOpenFile)));
 }
